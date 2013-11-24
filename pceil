@@ -1,0 +1,440 @@
+#!/usr/bin/env python
+#
+# Experimental TPTP to Isar proof translator.
+# Nik Sultana, Cambridge University Computer Lab, September 2013
+#
+# Usage:
+#   ls ../e_proofs/ -lS | tail
+#   ./e_recon/pceil -f ../e_proofs/SWV060+1.p.out
+#
+# Two methods are implemented here:
+#  - Geoff style
+#  - Tableau embedding
+#    Two approaches:
+#    A Embed and validate inference rules, then chain them up. This is
+#      harder to control by static means, since need to simulate bits of
+#      Isabelle to anticipate what unifiers it will produce (cf. the
+#      Leo2 experiment). Can this problem be eliminated?
+#    B Embed and validate inferences, while chaining them up.
+#      This uses more info from the proof, and provides better
+#      guidance to Isabelle to reconstruct the proof.
+#      This is the method implemented here.
+#
+# NOTE:
+#  - Currently this has only been tested with E proofs (in TSTP format).
+#    Could generalise it into a class which abstracts the formats of
+#    any TSTP-outputting prover. Then the translator for E to Isar
+#    would subclass this class.
+#
+# TODO:
+#  - need to discover problem's signature and use this info in the reconstruction, or can get by without?
+#  - universally close clauses.
+#  - how to handle the "hypothesis" role?
+#  - Known issues (from: ./e_recon/pceil -f ../e_proofs/SET876+1.p.out)
+#    - formula conversion needs the "g" regex modifier, since only being applied once.
+#    - convert "!=" into "~=".
+#  - Issues from SEU295+3.p.out: "assumes" appears in wrong place. (In both Tab and Geoff methods)
+#     (That problem is the first I've seen which can be reconstructed by Tab but not Geoff.)
+#  - Are there examples which can be translated by Geoff but not Tab?
+
+import sys
+import getopt
+import re
+import string
+from compiler.ast import flatten
+
+class AnnotatedFormula:
+  def __init__(self, language, name, role, fmla, annotation):
+    self.language = language.strip()
+    self.name = name.strip()
+    self.role = role.strip()
+    self.fmla = fmla.strip()
+    self.annotation = annotation.strip()
+    self.parents = []
+    self.inference = None
+
+#Dictionary mapping node names to annotated formula data
+pindex = {}
+prooffile = None
+verbose = False
+veryverbose = False
+geoffs_method = False
+debug = False
+
+opts, args = getopt.getopt(sys.argv[1:], "vf:gdV", [])
+
+for o, a in opts:
+  if o == "-f":
+    prooffile = a
+  elif o == "-v":
+    verbose = True
+  elif o == "-g":
+    geoffs_method = True
+  elif o == "-d":
+    debug = True
+  elif o == "-V":
+    veryverbose = True
+  else:
+    raise Exception('Unknown argument : ' + o + ':' + a)
+
+if prooffile == None:
+  raise Exception('No proof file specified')
+
+
+# Hacky matcher: Assumptions
+#  - There are never any spaces in the formula field, except for possibly a prefix.
+#  - The annotation field looks as described below.
+matcher_af = re.compile("^(fof|cnf)\((.+?),(.+?), *([^ ]+), *(file\(.+?\)|inference.+?|c_.+?)\)\.$")
+matcher_empty = re.compile("^\s+$")
+
+
+def tptp_to_isar_fmla (fmla):
+  def trans_false(f): return re.sub('\$false', 'False', f)
+  def trans_imp(f): return re.sub('=>', '-->', f)
+  def trans_iff(f): return re.sub('<-->', '=', f)
+  #No need to worry about typings below, because we don't write types in FOF/CNF.
+  def trans_quants(f): return re.sub('(\?|\!) *\[(.+?)\] *: *', '\\1 \\2 . ', f)
+  def trans_true(f): return re.sub('\$true', 'True', f)
+
+  return trans_false(
+    trans_imp(
+      trans_iff(
+        trans_quants(
+          trans_true(fmla)))))
+
+
+# Bracket quantifiers which aren't themselves contained in brackets.
+# This is a hack to deal with how Isabelle's syntax parser is fussy
+# in ways that E's pretty-printer isn't.
+# It implements a very simple method to work out where to put the
+# opening and closing parenthesis.
+def bracket_quants (fmla):
+  parenDepth = 0
+
+  st = []
+  def timeToAddClosingParen():
+    if st <> [] and st[-1] == parenDepth:
+      return True
+    else:
+      return False
+
+  fmla1 = ''
+  for c in fmla:
+    if c == '(':
+      parenDepth += 1
+    elif c == ')':
+      parenDepth -= 1
+      if timeToAddClosingParen():
+        fmla1 += ')'
+        st.pop()
+    elif (c == '!' or c == '?'): #This is the key bit.
+      fmla1 += '('
+      st.append(parenDepth)
+
+    fmla1 += c
+  return fmla1
+
+
+#Find the first function/predicate occurring in a formula.
+matcher_fun = re.compile("^(.*?)([a-z][a-zA-Z0-9_]+\()(.+)$")
+# Curry functions.
+def curry_funs1 (fmla):
+  match = matcher_fun.match(fmla)
+  if match <> None:
+    parenDepth = 0
+    prefix = match.group(1)
+    fun_name = match.group(2)
+    rest = match.group(3)
+    for c in prefix:
+      if c == '(': parenDepth += 1
+      elif c == ')': parenDepth -= 1
+
+    fmla1 = prefix + '(' + fun_name[0:(len(fun_name) - 1)] + ' '
+
+    return fmla1 + curry_funs1(rest)
+
+  else:
+    return fmla
+
+def curry_funs (fmla):
+  return re.sub(',', ' ', curry_funs1(fmla))
+
+
+matcher_file_annot = re.compile("^ *file\(.*\)$")
+
+
+#removes the "theory(...)" parent info you find in E proofs,
+# e.g. in inference(cn,[status(thm)],[c_0_5, theory(equality,[symmetry])])
+def remove_theory_subannot(s):
+  return re.sub(', *theory\(.+?\)', lambda _ : '', s)
+
+
+# Turn annotation into a python list. The list can contain
+# strings and lists. Strings are either atoms or operators
+# (e.g., "inference"). Lists consist of either operator
+# arguments, or actual lists from the original annotation.
+# e.g. "inference(cn, [status(thm)], [inference(rw, [status(thm)], [c_0_8 c_0_9])]), c_0_10)"
+#  (where the first element of the list is a derivation stack)
+#  becomes ["inference",["cn",["status",["thm"]],["inference",["rw",["status",["thm"]],["c_0_8","c_0_9"]]]],"c_0_10"]
+def process(s):
+  return re.sub(' *([^ ,\[\]]+?) *(,|\[|\]|$)', '"\\1"\\2',
+                re.sub('([a-z]+[a-zA-Z0-9_]+)\[', '\\1,[',
+                       re.sub('\)', lambda _ : ']',
+                              re.sub('\(', lambda _ : '[', s))))
+
+
+# Extract parent nodes. Also works with derivation stacks.
+def extract_parents(l):
+  if isinstance(l, basestring): #don't analyse strings
+    return [l]
+  else: #analyse lists
+    result = []
+    skip = False #this is set to true when we encounter an 'inference' element.
+                 #then we need to treat the following element as the argument
+                 #to that annotation.
+    for el in l:
+      if skip:
+        result.append(extract_parents(el[2]))
+        skip = False
+        continue
+
+      if el == 'inference':
+        skip = True
+      else:
+        skip = False
+        result.append(el)
+
+  return result
+
+
+#Extract node related to an inference from its annotation.
+def most_recent_node (annotation):
+  if debug:
+    print "tackling " + annotation
+  answer = None
+  annotation = remove_theory_subannot(annotation)
+
+  match = matcher_file_annot.match(annotation)
+  if match <> None:
+    if veryverbose: print '>matcher_file_annot'
+    answer = []
+  else:
+    l = eval(str(process(annotation)))
+    answer = filter (lambda x: x <> "'proof'", flatten(extract_parents(l)))
+  if debug:
+    print "D: from " + annotation + " got " + str(answer)
+
+  return answer
+
+
+class EAnnotatedFormula(AnnotatedFormula):
+  def __init__(self, language, name, role, fmla, annotation):
+    #FIXME call AnnotatedFormula's constructor instead of redoing this here?
+    global veryverbose
+    self.language = language.strip()
+    self.name = name.strip()
+    self.role = role.strip()
+    self.fmla = curry_funs(bracket_quants(fmla.strip()))
+    self.annotation = annotation.strip()
+    self.parents = most_recent_node(annotation)
+    if veryverbose:
+      print "\t|language: " + self.language
+      print "\t|name: " + self.name
+      print "\t|role: " + self.role
+      print "\t|fmla: " + self.fmla
+      print "\t|annotation: " + self.annotation
+      print "\t|parents: " + str(self.parents)
+
+
+#Print with a given space prefix
+class SPPrint:
+  def __init__(self):
+    self.sp = ''
+
+  def prnt(self, s):
+    print self.sp + s
+
+  def sp_add(self, n):
+    self.sp += ' ' * n
+
+  #Assumes that sp consists solely of spaces
+  def sp_dec(self, n):
+    self.sp = self.sp[n:]
+
+
+#Set of assumptions and definitions
+thy_ctxt = set([])
+
+#Method first described in a paper by Geoff AFAIK.
+#It is also implemented in Sledgehammer.
+def geoff_method (af, sprinter, i):
+  if i == 1:
+    sprinter.prnt ('lemma')
+
+  if len(af.parents) == 0:
+    if af.role == 'conjecture':
+      sprinter.prnt ('shows "' + tptp_to_isar_fmla(af.fmla) + '"')
+      sprinter.prnt ('proof (rule ccontr)')
+      sprinter.sp_add(2)
+      sprinter.prnt ('assume ' + af.name + ' : "~(' + tptp_to_isar_fmla(af.fmla) + ')"')
+      sprinter.prnt ('show "False"')
+      sprinter.prnt ('proof -')
+      sprinter.sp_add(2)
+    elif af.role == 'axiom' or af.role == 'definition':
+      sprinter.prnt ('assumes ' + af.name + ' : "' + tptp_to_isar_fmla(af.fmla) + '"')
+      thy_ctxt.add(af)
+    else:
+      sys.exit("Currently this role isn't supported: " + af.role)
+  else:
+    sprinter.prnt ('from ' + ' '.join(af.parents) + ' have ' + af.name + ' : "' + tptp_to_isar_fmla(af.fmla) + '" by blast')
+
+
+#Contains the clauses which are left to examine. Proof reconstruction stops when
+#we run out of these. In the course of analysis, clauses might be moved from this
+#stack to another structure -- see "core" further down.
+tab_embeds_stack = []
+
+tab_embeds_rules = []
+def tab_embed (af, sprinter, i):
+  if i == 1:
+    sprinter.prnt ('lemma')
+
+  if len(af.parents) == 0:
+    if af.role == 'conjecture':
+      sprinter.prnt ('shows "' + tptp_to_isar_fmla(af.fmla) + '"')
+      sprinter.prnt ('proof (rule ccontr)')
+      sprinter.sp_add(2)
+      sprinter.prnt ('assume ' + af.name + ' : "~(' + tptp_to_isar_fmla(af.fmla) + ')"')
+      sprinter.prnt ('show "False"')
+      sprinter.prnt ('proof -')
+      sprinter.sp_add(2)
+    elif af.role == 'axiom' or af.role == 'definition':
+      sprinter.prnt ('assumes ' + af.name + ' : "' + tptp_to_isar_fmla(af.fmla) + '"')
+      thy_ctxt.add(af)
+    else:
+      sys.exit("Currently this role isn't supported: " + af.role)
+  else:
+    sprinter.prnt ('let ?' + af.name + ' = "' + tptp_to_isar_fmla(af.fmla) + '"')
+    tab_embeds_stack.append(af.name)
+
+
+#This is a subset of the thy_ctxt.
+#It is the unsat-core of the problem; at the end of the process it
+#will contain collection of formulas which are provably inconsistent.
+#It starts out empty, then grows monotonically.
+core = []
+
+
+tab_embeds_rules = []
+cur_rule_idx = 0
+#Generate an inference, based on what's on the stack.
+def tab_embed_geninference ():
+  global cur_rule_idx
+  global core
+  global tab_embeds_stack
+  inference = None
+  newrule = None
+  if tab_embeds_stack <> []:
+    clauses = map (lambda s: '?' + s, tab_embeds_stack)
+    core_clauses = map (lambda s: '?' + s, core)
+
+    # If all of a clause's parents are in $thy_ctxt \cup core$
+    # then the clause can be dropped. Otherwise add it to the core.
+    redundant = reduce(lambda acc, v:
+                         # acc and (v in (tab_embeds_stack + map (lambda x: x.parents, thy_ctxt))),
+                         # acc and (v in (tab_embeds_stack + map (lambda x: x.name, thy_ctxt))),
+                         acc and (v in (tab_embeds_stack)),
+                       pindex[tab_embeds_stack[-1]].parents,
+                       True)
+    if not redundant:
+      core.append(tab_embeds_stack[-1])
+
+    tab_embeds_stack.pop()
+    newrule = 'r' + str(cur_rule_idx + 1)
+    if cur_rule_idx > 0:
+      #FIXME constants strewn all over the place. particularly bad is the 'r' prefix below (and above)
+      inference = ('from r' + str(cur_rule_idx) + ' have ' + newrule + ' : "[|' +
+                   '; '.join(core_clauses + clauses) + '|] ==> False" by blast')
+    else:
+      inference = 'have ' + newrule + ' : "[|' + '; '.join(clauses) + '|] ==> False" by blast'
+    cur_rule_idx += 1
+  return (newrule, inference)
+
+
+conjecture_af = None
+
+
+sprinter = SPPrint()
+PF_FD = open(prooffile, "r")
+line_count = 0
+for line in PF_FD:
+  line_count += 1
+  if verbose:
+    sprinter.prnt ('(*' + line.strip() + '*)')
+  match = matcher_af.match(line)
+  if match <> None:
+    af = EAnnotatedFormula(match.group(1), match.group(2), match.group(3), match.group(4), match.group(5))
+    try:
+      x = pindex[match.group(2)]
+      #This should not be reachable if the proof is well-formed.
+      sys.exit("More than one node named: " + match.group(2))
+    except KeyError:
+      pindex[match.group(2)] = af
+
+    if verbose:
+      print '(*' + af.name + ' -> ' + str(af.parents) + '*)'
+
+    if af.role == 'conjecture':
+      conjecture_af = af
+
+    if geoffs_method:
+      geoff_method (af, sprinter, line_count)
+    else:
+      tab_embed (af, sprinter, line_count)
+  else:
+    match = matcher_empty.match(line)
+    if match <> None:
+      pass
+    else:
+      sys.exit("Could not match: " + line)
+
+
+PF_FD.close()
+
+
+# Returns the (assumedly) single parent of a node,
+# or the node itself if it's an orphan (i.e., tip).
+# This is applied to the contents of the "core" list,
+# to make sure that the order of their appearance in the
+# last "have" line (giving us the last rule) matches the
+# order used in the last ("show") line, since Isar is
+# sensitive to order.
+# NOTE: assumes that elements of "core" have a single parent
+def tip(x):
+  if pindex[x].parents == []:
+    return x
+  else:
+    return pindex[x].parents[0] # NOTE: assumes that elements of "core" have a single parent
+
+
+if geoffs_method:
+  sprinter.prnt ('thus ?thesis by blast')
+  sprinter.sp_dec(2)
+  sprinter.prnt ('qed')
+  sprinter.sp_dec(2)
+  sprinter.prnt ('qed')
+else:
+  latestrule = None
+  while True:
+    newrule, inference = tab_embed_geninference ()
+    if inference == None: break
+    latestrule = newrule
+    sprinter.prnt (inference)
+
+  sprinter.prnt ('from ' + ' '.join(map (tip, core)) +
+                 ' show ?thesis by (rule ' +
+                 latestrule + ')')
+  sprinter.sp_dec(2)
+  sprinter.prnt ('qed')
+  sprinter.sp_dec(2)
+  sprinter.prnt ('qed')
