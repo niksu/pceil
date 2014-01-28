@@ -92,6 +92,7 @@ def tptp_to_isar_fmla (fmla):
   def trans_false(f): return re.sub('\$false', 'False', f)
   def trans_imp(f): return re.sub('=>', '-->', f)
   def trans_iff(f): return re.sub('<-->', '=', f)
+  def trans_neq(f): return re.sub('!=', '~=', f)
   #No need to worry about typings below, because we don't write types in FOF/CNF.
   def trans_quants(f): return re.sub('(\?|\!) *\[(.+?)\] *: *', '\\1 \\2 . ', f)
   def trans_true(f): return re.sub('\$true', 'True', f)
@@ -100,7 +101,8 @@ def tptp_to_isar_fmla (fmla):
     trans_imp(
       trans_iff(
         trans_quants(
-          trans_true(fmla)))))
+          trans_true(
+            trans_neq(fmla))))))
 
 
 # Bracket quantifiers which aren't themselves contained in brackets.
@@ -119,19 +121,22 @@ def bracket_quants (fmla):
       return False
 
   fmla1 = ''
-  for c in fmla:
-    if c == '(':
+  for i in range(0, len(fmla)):
+    if fmla[i] == '(':
       parenDepth += 1
-    elif c == ')':
+    elif fmla[i] == ')':
       parenDepth -= 1
       if timeToAddClosingParen():
         fmla1 += ')'
         st.pop()
-    elif (c == '!' or c == '?'): #This is the key bit.
+    elif ((fmla[i] == '!' or fmla[i] == '?') and
+          (i + 1 < len(fmla)) and
+          (fmla[i + 1] <> '=')): # To avoid acting on "!="
+      #This is the key bit.
       fmla1 += '('
       st.append(parenDepth)
 
-    fmla1 += c
+    fmla1 += fmla[i]
   return fmla1
 
 
